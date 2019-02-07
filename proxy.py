@@ -22,8 +22,8 @@
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from socket import socket, SOL_SOCKET, SO_REUSEADDR
 from struct import unpack_from as raw_unpack
-from threading import Thread
-
+from threading import Thread, active_count
+from uuid import uuid4
 
 HELP = """\
 Simple proxy server for the Bolt protocol.
@@ -152,18 +152,31 @@ class Peer(object):
         self.socket = socket
         self.address = address
 
+    def get_address(self): 
+        return self.address
+
 
 class ProxyPair(Thread):
 
-    def __init__(self, client, server):
+    def __init__(self, client, server, event_listener):
         super(ProxyPair, self).__init__()
+        self.pair_id = uuid4()
         self.client = client
         self.server = server
+        self.event_listener = event_listener
         print("C: [CONNECT] {} -> {}".format(self.client.address, self.server.address))
+
+    def __str__(self):
+        return("<ProxyPair %s %s => %s>" % 
+            (self.pair_id, self.client.get_address(), self.server.get_address()))
+
+    def connection_id(self):
+        return self.pair_id
 
     def run(self):
         client = self.client
         server = self.server
+        self.event_listener(self, 'open', {})
         print("C: [BOLT] {}".format(h(self.forward(client, server, 4))))
         print("C: [HANDSHAKE] {}".format(h(self.forward(client, server, 16))))
         print("S: [HANDSHAKE] {}".format(h(self.forward(server, client, 4))))
@@ -173,6 +186,7 @@ class ProxyPair(Thread):
                 self.forward_exchange(client, server)
             except RuntimeError:
                 more = False
+        self.event_listener(self, 'close', {})
         print("C: [CLOSE]")
 
     def forward(self, source, target, size):
@@ -206,8 +220,9 @@ class ProxyPair(Thread):
             rs_message = self.forward_message(server, client)
             rs_signature = rs_message[1]
             rs_data = Packed(rs_message[2:]).unpack_all()
-            print("S: {} {}".format(message_names[rs_signature], " ".join(map(repr, rs_data))))
+            print("S: {} {}".format(message_names[rs_signature], " ".join(map(repr, rs_data))))            
             more = rs_signature == 0x71
+            self.event_listener(self, 'send', { "more": more })
 
 
 class ProxyServer(Thread):
@@ -217,14 +232,35 @@ class ProxyServer(Thread):
     def __init__(self, bind_address, server_address):
         super(ProxyServer, self).__init__()
         self.socket = socket()
+        self.proxy_id = uuid4()
         self.socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
         self.socket.bind(bind_address)
         self.socket.listen(0)
         self.server_address = server_address
-        self.pairs = []
+        self.pairs = {}
 
     def __del__(self):
         self.stop()
+
+    def pair_event_listener(self, pair, event, data):
+        print("Pair event listener")
+        print(pair)
+        print(event)
+        print(data)
+
+        if event == "close":
+            self.deregister_pair(pair)
+
+        return True
+
+    def deregister_pair(self, pair):
+        result = self.pairs.pop(pair.connection_id(), None)
+        print("Proxy: deregistering %s" % pair.connection_id())
+        self.stats()
+        return result
+
+    def stats(self):
+        print("Proxy: %d active pairs, %d threads" % (len(self.pairs.keys()), active_count()))
 
     def run(self):
         self.running = True
@@ -234,9 +270,11 @@ class ProxyServer(Thread):
             server_socket.connect(self.server_address)
             client = Peer(client_socket, client_address)
             server = Peer(server_socket, self.server_address)
-            pair = ProxyPair(client, server)
+            pair = ProxyPair(client, server,
+                lambda pair, event, data: self.pair_event_listener(pair, event, data))
             pair.start()
-            self.pairs.append(pair)
+            self.pairs[pair.connection_id()] = pair
+            self.stats()
 
     def stop(self):
         self.running = False
@@ -246,7 +284,7 @@ def run():
     parser = ArgumentParser(description=HELP, formatter_class=RawDescriptionHelpFormatter)
     parser.add_argument("-b", "--bind-address", help="bind address for the proxy server")
     parser.add_argument("-s", "--server-address", help="Neo4j server address")
-
+    print(uuid4())
     args = parser.parse_args()
 
     if not args.bind_address or not args.server_address:
